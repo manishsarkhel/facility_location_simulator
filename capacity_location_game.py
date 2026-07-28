@@ -1,47 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 Facility Location & Network Design Simulator — Quick-Commerce Dark-Store Edition
-==================================================================================
-Teaching companion for: "Why does Blinkit's dark-store model work in Chandigarh
-and Dehradun, but not in Paonta Sahib?" — a facility-location / network-design
-exercise built around demand density, delivery service-radius constraints, and
-dark-store unit economics.
-
 Author: Manish Sarkhel, IIM Sirmaur (PGPEX-LSM)
 
-WHAT CHANGED FROM THE ORIGINAL SCRIPT (and why):
-1. BUG FIX — coordinate projection: the original ran KMeans directly on raw
-   (lat, lon) and then multiplied the resulting "distances" by a cost-per-km
-   figure. But 1 degree of longitude does not equal 1 degree of latitude in
-   real km (it shrinks by cos(latitude)). That silently distorted every
-   facility placement and every cost number. This version projects points to
-   a local (x, y) km grid before clustering, and un-projects facility
-   locations back to lat/lon only for drawing the map.
-2. BUG FIX — units: the original computed `distances` in *degree* units from
-   kmeans.transform() but then treated them as km. Now transform() operates
-   on the km-projected coordinates, so distances are genuinely in km.
-3. NEW — demand is density-weighted and shape-aware, not uniform-random in a
-   circle. A compact city (Chandigarh) concentrates demand near a centre; a
-   highway/corridor town (Paonta Sahib) spreads demand along an axis. This is
-   the geometric heart of the teaching point: density AND shape both matter.
-4. NEW — a delivery *service radius* (the 10-15 minute promise). Demand
-   outside this radius from every facility is NOT captured by the
-   quick-commerce channel, regardless of how "optimal" the facility
-   locations are. This is what the original cost-minimizing KMeans model
-   could never show.
-5. NEW — dark-store breakeven economics (fixed cost, contribution margin per
-   order) so viability is a number students can check, not a vibe.
-6. NEW — a three-city "Compare" mode with a shared bar chart against the
-   breakeven line, and discussion prompts for class.
-
-NOTE ON DATA: city population, penetration, and cost figures below are
-ILLUSTRATIVE planning assumptions for classroom use, not verified census or
-company data. Everything is editable in the sidebar — encourage students to
-challenge the assumptions and re-run.
+Fixes a coordinate-projection bug in the original script (KMeans was run on
+raw lat/lon, whose degree-to-km ratio is not constant, so distances and costs
+were wrong). Points are now projected to a local (x, y) km grid before
+clustering and un-projected only for map display.
 
 To run:
-    pip install streamlit numpy pandas plotly scikit-learn folium streamlit-folium
+    pip install -r requirements.txt
     streamlit run facility_location_sim.py
+
+See instructor_notes.md for teaching context and discussion material.
 """
 
 import numpy as np
@@ -62,14 +33,12 @@ KM_PER_DEG_LAT = 111.0
 
 
 def project_to_km(lat, lon, center_lat, center_lon):
-    """Convert lat/lon to local (x, y) km coordinates around a centre point."""
     y = (lat - center_lat) * KM_PER_DEG_LAT
     x = (lon - center_lon) * KM_PER_DEG_LAT * np.cos(np.radians(center_lat))
     return x, y
 
 
 def unproject_from_km(x, y, center_lat, center_lon):
-    """Inverse of project_to_km: local km coordinates back to lat/lon."""
     lat = center_lat + y / KM_PER_DEG_LAT
     lon = center_lon + x / (KM_PER_DEG_LAT * np.cos(np.radians(center_lat)))
     return lat, lon
@@ -84,32 +53,31 @@ def zoom_for_radius(radius_km):
 
 
 # ----------------------------------------------------------------------------
-# 2. CITY PRESETS — the three-city teaching narrative
+# 2. CITY PRESETS
 # ----------------------------------------------------------------------------
 
 CITY_PRESETS = {
     "Chandigarh — dense, planned grid": {
-        "lat": 30.7333, "lon": 76.7794, "radius_km": 10,
+        "lat": 30.7333, "lon": 76.7794, "radius_km": 10, "seed": 1,
         "population": 1_055_000, "penetration": 0.35, "orders_per_user_day": 0.25,
         "shape": "radial", "concentration": 0.65,
-        "story": ("Compact, planned city with a dense core, high smartphone/UPI "
-                  "penetration and short average distances — near-ideal geography "
-                  "for a 10-minute delivery promise."),
+        "context": ("Compact, planned city with a dense core, high smartphone/UPI "
+                    "penetration and short average distances."),
     },
     "Dehradun — larger, but urban core still dense": {
-        "lat": 30.3165, "lon": 78.0322, "radius_km": 13,
+        "lat": 30.3165, "lon": 78.0322, "radius_km": 13, "seed": 2,
         "population": 800_000, "penetration": 0.28, "orders_per_user_day": 0.20,
         "shape": "radial", "concentration": 0.80,
-        "story": ("More sprawl than Chandigarh, but the urban core is still dense "
-                  "enough to support several viable dark stores near the centre."),
+        "context": ("More sprawl than Chandigarh, but the urban core is still dense "
+                    "enough to support several dark stores near the centre."),
     },
     "Paonta Sahib — small, dispersed corridor town": {
-        "lat": 30.4359, "lon": 77.6248, "radius_km": 8,
+        "lat": 30.4359, "lon": 77.6248, "radius_km": 8, "seed": 3,
         "population": 35_000, "penetration": 0.12, "orders_per_user_day": 0.12,
         "shape": "corridor", "concentration": 1.0,
-        "story": ("Small industrial town strung along a highway/river-valley "
-                  "corridor rather than a compact core; lower digital penetration "
-                  "and far fewer households per sq km than a state-capital market."),
+        "context": ("Small industrial town strung along a highway/river-valley "
+                    "corridor rather than a compact core; lower digital penetration "
+                    "and far fewer households per sq km than a state-capital market."),
     },
 }
 
@@ -118,19 +86,11 @@ CITY_PRESETS = {
 # ----------------------------------------------------------------------------
 
 
-def generate_demand_points(n_points, radius_km, shape="radial", concentration=0.7):
-    """
-    Sample n_points demand locations in local km coords, centred at (0, 0).
-
-    shape:
-        'radial'   — concentric city: points cluster toward the centre.
-        'corridor' — linear highway-town: points spread along an axis with a
-                     narrow lateral band, NOT concentrated at one centre.
-    concentration: 0 = uniform over the disc, 1 = strongly pulled toward the
-                   centre. Only used for 'radial' shape.
-    """
+def generate_demand_points(n_points, radius_km, shape="radial", concentration=0.7, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
     if shape == "radial":
-        power = 1.0 + concentration  # >1 pulls samples toward r = 0
+        power = 1.0 + concentration
         r = radius_km * (np.random.random(n_points) ** power)
         theta = np.random.uniform(0, 2 * np.pi, n_points)
         x = r * np.cos(theta)
@@ -139,7 +99,7 @@ def generate_demand_points(n_points, radius_km, shape="radial", concentration=0.
         along = np.random.uniform(-radius_km, radius_km, n_points)
         lateral_sigma = radius_km * 0.12
         lateral = np.random.normal(0, lateral_sigma, n_points)
-        angle = np.radians(35)  # arbitrary corridor bearing
+        angle = np.radians(35)
         x = along * np.cos(angle) - lateral * np.sin(angle)
         y = along * np.sin(angle) + lateral * np.cos(angle)
     return x, y
@@ -151,16 +111,11 @@ def generate_demand_points(n_points, radius_km, shape="radial", concentration=0.
 
 
 def solve_facility_location(x, y, weights, n_facilities, seed=42):
-    """
-    Weighted KMeans in km-space. Fixes the original bug of clustering on raw
-    lat/lon (which distorts distances since 1 degree of longitude != 1 degree
-    of latitude in real km away from the equator).
-    """
     n_facilities = max(1, min(n_facilities, len(x)))
     pts = np.column_stack([x, y])
     km = KMeans(n_clusters=n_facilities, random_state=seed, n_init=10)
     km.fit(pts, sample_weight=weights)
-    dist_matrix = km.transform(pts)  # genuinely in km, since input was km
+    dist_matrix = km.transform(pts)
     nearest_dist = np.min(dist_matrix, axis=1)
     assignment = km.labels_
     return km.cluster_centers_, nearest_dist, assignment
@@ -171,11 +126,6 @@ def solve_facility_location(x, y, weights, n_facilities, seed=42):
 # ----------------------------------------------------------------------------
 
 st.title("📍 Facility Location & Network Design: Quick-Commerce Edition")
-st.caption(
-    "Why does Blinkit's dark-store model work in Chandigarh and Dehradun, but "
-    "not in Paonta Sahib? Adjust demand density, the delivery-radius promise, "
-    "and dark-store economics below, and see where the model breaks."
-)
 
 st.sidebar.header("1. Scenario")
 mode = st.sidebar.radio("Mode", ["Single scenario", "Compare all three cities"])
@@ -189,23 +139,25 @@ else:
 n_facilities = st.sidebar.slider("Number of dark stores", 1, 10, 3)
 n_points_slider = st.sidebar.slider(
     "Demand sample points (simulation resolution)", 50, 400, 200, 25,
-    help="More points = smoother density pattern. Total order volume stays "
-         "fixed by population × penetration × orders/user — this slider only "
-         "controls simulation resolution, not demand itself."
+    help="More points = smoother density pattern. Total order volume is fixed "
+         "by population × penetration × orders/user; this only controls resolution."
 )
 
 st.sidebar.header("2. Quick-commerce delivery promise")
 service_radius = st.sidebar.slider(
     "Delivery service radius (km)", 1.0, 6.0, 2.0, 0.25,
-    help="The distance within which the platform commits to fast delivery. "
-         "Demand outside this radius from every facility is NOT captured by "
+    help="Demand outside this radius from every facility is not captured by "
          "the quick-commerce channel."
 )
 
-st.sidebar.header("3. Dark-store economics (₹)")
-fixed_cost_month = st.sidebar.number_input("Fixed cost per store / month (₹)", value=450_000, step=25_000)
+st.sidebar.header("3. Cost structure (₹)")
+fixed_cost_month = st.sidebar.number_input("Fixed cost per store / month (₹)", value=450_000, step=25_000,
+    help="Rent, staff, equipment — cost of simply keeping a store open, independent of order volume.")
 contribution_per_order = st.sidebar.number_input("Contribution margin per order (₹)", value=30, step=1,
     help="Revenue per order minus variable delivery/packing cost.")
+transport_cost_per_order_km = st.sidebar.number_input("Delivery cost per order per km (₹)", value=5, step=1,
+    help="Variable cost of physically delivering one order one km. This is what "
+         "rises as stores get farther apart and falls as you add more, closer stores.")
 
 daily_fixed_cost = fixed_cost_month / 30
 breakeven_orders = daily_fixed_cost / contribution_per_order
@@ -214,9 +166,9 @@ st.sidebar.metric("→ Breakeven orders / store / day", f"{breakeven_orders:,.0f
 
 def render_scenario(name, cfg, n_facilities, n_points, service_radius, breakeven_orders, daily_fixed_cost, contribution_per_order):
     st.subheader(name)
-    st.write(cfg["story"])
+    st.write(cfg["context"])
 
-    x, y = generate_demand_points(n_points, cfg["radius_km"], cfg["shape"], cfg.get("concentration", 0.7))
+    x, y = generate_demand_points(n_points, cfg["radius_km"], cfg["shape"], cfg.get("concentration", 0.7), seed=cfg["seed"])
     total_orders_day = cfg["population"] * cfg["penetration"] * cfg["orders_per_user_day"]
     weight_per_point = total_orders_day / n_points
     weights = np.full(n_points, weight_per_point)
@@ -274,7 +226,7 @@ def render_scenario(name, cfg, n_facilities, n_points, service_radius, breakeven
 
     st.dataframe(store_df, use_container_width=True)
 
-    return {
+    result = {
         "name": name,
         "total_orders": total_orders_day,
         "captured": captured_orders,
@@ -284,22 +236,63 @@ def render_scenario(name, cfg, n_facilities, n_points, service_radius, breakeven
         "n_stores": len(store_df),
         "network_profit": network_profit,
     }
+    return result, x, y, weights
+
+
+def render_cost_tradeoff(name, x, y, weights, daily_fixed_cost, transport_cost_per_order_km, current_n):
+    """
+    Classic facility-location trade-off: as the number of facilities rises,
+    total fixed cost rises linearly while average delivery distance — and
+    therefore total variable/transport cost — falls. This sweep ignores the
+    quick-commerce service-radius promise on purpose: it shows the general
+    network-design trade-off, separate from the viability check above.
+    """
+    ks = list(range(1, 11))
+    rows = []
+    for k in ks:
+        _, nearest_dist, _ = solve_facility_location(x, y, weights, k)
+        total_transport = np.sum(nearest_dist * weights) * transport_cost_per_order_km
+        total_fixed = k * daily_fixed_cost
+        rows.append({
+            "Facilities": k,
+            "Fixed cost (₹/day)": total_fixed,
+            "Transport cost (₹/day)": total_transport,
+            "Total cost (₹/day)": total_fixed + total_transport,
+        })
+    df = pd.DataFrame(rows)
+    optimal_k = int(df.loc[df["Total cost (₹/day)"].idxmin(), "Facilities"])
+
+    fig = px.line(
+        df, x="Facilities",
+        y=["Fixed cost (₹/day)", "Transport cost (₹/day)", "Total cost (₹/day)"],
+        markers=True, title=f"{name}: fixed vs. delivery cost trade-off (network-wide, unconstrained by service radius)"
+    )
+    fig.add_vline(x=current_n, line_dash="dot", line_color="gray", annotation_text="Current setting")
+    fig.add_vline(x=optimal_k, line_dash="dash", line_color="green", annotation_text=f"Cost-minimizing = {optimal_k}")
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        f"Cost-minimizing network size here: **{optimal_k} facilities**. "
+        f"Fewer stores concentrate fixed cost but stretch delivery distance; "
+        f"more stores shrink delivery distance but multiply fixed cost."
+    )
+    return df, optimal_k
 
 
 summary_rows = []
 for name, cfg in scenarios_to_run.items():
-    result = render_scenario(
+    result, x, y, weights = render_scenario(
         name, cfg, n_facilities, n_points_slider, service_radius,
         breakeven_orders, daily_fixed_cost, contribution_per_order
     )
     summary_rows.append(result)
+    render_cost_tradeoff(name, x, y, weights, daily_fixed_cost, transport_cost_per_order_km, n_facilities)
     st.divider()
 
 # ----------------------------------------------------------------------------
-# 6. CROSS-CITY TAKEAWAY (only meaningful with more than one scenario)
+# 6. CROSS-CITY SUMMARY (only meaningful with more than one scenario)
 # ----------------------------------------------------------------------------
 if len(summary_rows) > 1:
-    st.header("📊 The Cross-City Takeaway")
+    st.header("📊 Cross-City Summary")
     summary_df = pd.DataFrame(summary_rows)[
         ["name", "avg_orders_per_store", "n_viable", "n_stores", "coverage_pct", "network_profit"]
     ]
@@ -312,17 +305,3 @@ if len(summary_rows) > 1:
     fig.add_hline(y=breakeven_orders, line_dash="dash", line_color="red",
                   annotation_text="Breakeven threshold")
     st.plotly_chart(fig, use_container_width=True)
-
-st.markdown("""
-**Discussion prompts for class:**
-1. Try increasing the number of dark stores in Paonta Sahib. Does adding facilities fix
-   the problem, or does it just divide a small demand pie into smaller, less viable slices?
-2. Compare the *shape* of demand in Paonta Sahib (a highway corridor) with Chandigarh's
-   compact radial city. Why does geometry — not just population — change how many
-   facilities you need to cover a given service radius?
-3. What would have to change in Paonta Sahib for a 10-minute delivery model to become
-   viable — penetration, order frequency, service radius, or the store's cost structure?
-4. This is a simplified teaching model — which real-world factors (actual road network vs.
-   straight-line distance, rider availability, SKU assortment, cold-chain needs) would
-   change the answer?
-""")
